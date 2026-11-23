@@ -117,6 +117,13 @@ def switch(release):
     link.replace('/opt/web-proxy/current')
 
 
+def release_permissions(release):
+    # The archive's '.' entry can restore a root-only temporary directory mode.
+    release.chmod(0o755)
+    for path in release.rglob('*'):
+        path.chmod(0o755 if path.is_dir() or path.name == 'shifter-web' else 0o644)
+
+
 def main(args):
     node, mode, commit, artifact, sha = args
     node = json.loads(node)
@@ -138,8 +145,11 @@ def main(args):
     release.mkdir(mode=0o755)
     with tarfile.open(artifact) as archive:
         archive.extractall(release, filter='data')
-    for p in release.rglob('*'):
-        p.chmod(0o755 if p.is_dir() or p.name == 'shifter-web' else 0o644)
+    release_permissions(release)
+    for role in ['api', 'gateway']:
+        run('runuser', '-u', 'web-' + role, '--', 'test', '-x', str(release))
+        run('runuser', '-u', 'web-' + role, '--', 'test', '-x', str(release / 'shifter-web'))
+        run('runuser', '-u', 'web-' + role, '--', 'test', '-r', str(release / 'web/sdk/v1/shifter-web-proxy.js'))
     require(digest(release / 'web/sdk/v1/shifter-web-proxy.js') == before['loader_sha256'], 'stable loader promotion is not authorized')
     for old in (previous / 'web/sdk/releases').rglob('*'):
         if old.is_file():

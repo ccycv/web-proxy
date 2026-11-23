@@ -4,6 +4,7 @@ import io
 import tarfile
 import tempfile
 import unittest
+import stat
 from pathlib import Path
 
 
@@ -20,6 +21,19 @@ COMMIT = 'a' * 40
 
 
 class NativeReleaseTests(unittest.TestCase):
+    def test_release_root_is_traversable_after_private_archive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            (root / 'web').mkdir(mode=0o700)
+            (root / 'shifter-web').write_text('binary')
+            (root / 'web' / 'index.html').write_text('asset')
+            node.release_permissions(root)
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE((root / 'web').stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE((root / 'shifter-web').stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE((root / 'web/index.html').stat().st_mode), 0o644)
+
     def package(self, path, extra=None, wrong_digest=False):
         binary = bytearray(24)
         binary[:6] = b'\x7fELF\x02\x01'
