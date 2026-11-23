@@ -1,11 +1,12 @@
 use crate::{
     State, captcha,
+    captcha_config::CaptchaSettings,
     config::{Integration, countries, find_integration, random_id, valid_country},
     store::Session,
 };
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State as AppState, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Query, State as AppState, rejection::JsonRejection},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE},
@@ -195,12 +196,55 @@ pub fn router(s: &State) -> Router<State> {
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(cors)
 }
-async fn config(AppState(s): AppState<State>, h: HeaderMap) -> Result<Json<Value>> {
+#[derive(Deserialize)]
+struct SdkCapabilities {
+    captcha: Option<String>,
+}
+
+fn advertise_cap(preferred: bool, accept_both: bool, capability: Option<&str>) -> bool {
+    preferred && (!accept_both || capability == Some("cap"))
+}
+
+async fn config(
+    AppState(s): AppState<State>,
+    Query(sdk): Query<SdkCapabilities>,
+    h: HeaderMap,
+) -> Result<Json<Value>> {
     let (site, _) = integration(&h, &s)?;
-    Ok(Json(
-        json!({"site":site.site, "countries":countries().iter().map(|(code,name)|json!({"code":code,"name":name})).collect::<Vec<_>>(),
-        "runtimeOrigin":s.cfg.runtime_origin,"captchaSiteKey":s.cfg.captcha_site_key,"protocolVersion":1}),
-    ))
+    let body = config_body(
+        site,
+        &s.cfg.runtime_origin,
+        &s.cfg.captcha,
+        sdk.captcha.as_deref(),
+    );
+    Ok(Json(body))
+}
+
+/// The `/api/v1/config` answer for one integration and the SDK's `?captcha=` capability.
+fn config_body(
+    site: &Integration,
+    runtime_origin: &str,
+    captcha: &CaptchaSettings,
+    capability: Option<&str>,
+) -> Value {
+    let mut body = json!({"site":site.site, "countries":countries().iter().map(|(code,name)|json!({"code":code,"name":name})).collect::<Vec<_>>(),
+        "runtimeOrigin":runtime_origin,"captchaSiteKey":captcha.site_key,"captchaProvider":"recaptcha","protocolVersion":1});
+    if let Some(cap) = captcha
+        .cap
+        .as_ref()
+        .filter(|_| advertise_cap(captcha.cap_preferred, captcha.accept_both, capability))
+    {
+        // Public values only: the site key and where the widget and challenges live.
+        let key = cap
+            .site(&site.origin)
+            .map(|c| c.site_key.as_str())
+            .unwrap_or_default();
+        body["captchaProvider"] = json!("cap");
+        body["captchaSiteKey"] = json!(key);
+        body["capEndpoint"] = json!(format!("{}/{key}/", cap.public_url));
+        body["capAssets"] = json!(format!("{}/assets/", cap.public_url));
+    }
+    body
 }
 async fn start(
     AppState(s): AppState<State>,
@@ -252,7 +296,7 @@ async fn start(
             .map_err(storage)?;
         expected.as_deref() == Some(hostname.as_str())
     } else {
-        captcha::verify(&s, &input.captcha_token, &hostname)
+        captcha::verify_for_integration(&s, &input.captcha_token, &hostname, &site.origin)
             .await
             .map_err(|_| {
                 Error(
@@ -400,3 +444,7 @@ async fn stop(AppState(s): AppState<State>, h: HeaderMap) -> Result<Json<Value>>
     s.store.change(&current, None).await.map_err(storage)?;
     Ok(Json(json!({"status":"stopped"})))
 }
+
+#[cfg(test)]
+#[path = "sdk_api_tests.rs"]
+mod tests;

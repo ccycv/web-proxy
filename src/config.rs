@@ -1,3 +1,4 @@
+use crate::captcha_config::{self, CaptchaSettings};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{env, net::IpAddr};
@@ -171,8 +172,7 @@ pub struct Config {
     pub redis_ca_file: Option<String>,
     pub control_origin: String,
     pub integrations: Vec<Integration>,
-    pub captcha_site_key: String,
-    pub captcha_secret: String,
+    pub captcha: CaptchaSettings,
     pub runtime_origin: String,
     pub region: String,
     pub upstream_host: String,
@@ -259,20 +259,6 @@ pub fn integrations(value: &str, runtime: &str, production: bool) -> Result<Vec<
     Ok(entries)
 }
 
-pub fn validate_captcha(site_key: &str, secret: &str, production: bool) -> Result<()> {
-    const TEST_SITE: &str = "6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI";
-    const TEST_SECRET: &str = "6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe";
-    if production
-        && (site_key.is_empty()
-            || secret.is_empty()
-            || site_key == TEST_SITE
-            || secret == TEST_SECRET)
-    {
-        bail!("production API requires real reCAPTCHA v2 credentials");
-    }
-    Ok(())
-}
-
 #[derive(Deserialize)]
 struct Secrets {
     shifter: Account,
@@ -309,106 +295,24 @@ impl Config {
             bail!("APP_ENV must be development, test, or production");
         }
         let production = environment == "production";
+        let test_mode = environment == "test";
         let control_origin = val("CONTROL_ORIGIN", "http://localhost:8080");
         let runtime_origin = val("RUNTIME_ORIGIN", "http://localhost:8081");
-        let configured_integrations = if production {
-            env::var("INTEGRATIONS").context("production requires explicit INTEGRATIONS")?
-        } else {
-            val(
-                "INTEGRATIONS",
-                &serde_json::json!([{"origin":control_origin,"site":"local"}]).to_string(),
-            )
-        };
-        let integrations = integrations(&configured_integrations, &runtime_origin, production)?;
-        let redis = match env::var("REDIS_URL_FILE") {
-            Ok(path) => std::fs::read_to_string(path)
-                .map_err(|_| anyhow::anyhow!("cannot read REDIS_URL_FILE"))?
-                .trim()
-                .to_owned(),
-            Err(_) => val("REDIS_URL", "redis://redis:6379/"),
-        };
-        if production {
-            let (host, port) = production_redis(&redis)?;
-            let addresses: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
-                .await
-                .map_err(|_| anyhow::anyhow!("production Redis private DNS lookup failed"))?
-                .collect();
-            if addresses.is_empty() || addresses.iter().any(|a| !private_ip(a.ip())) {
-                bail!("production Redis must resolve only to private RFC1918/ULA addresses");
-            }
-        }
-        let test_mode = environment == "test";
+        let integrations = load_integrations(&control_origin, &runtime_origin, production)?;
+        let redis = load_redis(production).await?;
         let role = val("ROLE", "api");
         if !["api", "gateway"].contains(&role.as_str()) {
             bail!("invalid ROLE");
         }
-        let captcha_site_key = val("RECAPTCHA_SITE_KEY", "");
-        // Only the API process receives the verification secret.
-        let captcha_secret = if role == "api" {
-            match env::var("RECAPTCHA_SECRET_FILE") {
-                Ok(path) if !path.is_empty() => std::fs::read_to_string(path)
-                    .map_err(|_| anyhow::anyhow!("cannot read RECAPTCHA_SECRET_FILE"))?
-                    .trim()
-                    .to_owned(),
-                _ => String::new(),
-            }
-        } else {
-            String::new()
+        let scope = captcha_config::Scope {
+            environment: &environment,
+            role: &role,
+            control_origin: &control_origin,
+            integrations: &integrations,
         };
-        if role == "api" {
-            validate_captcha(&captcha_site_key, &captcha_secret, production)?;
-        }
-        let region = val("SHIFTER_REGION", "blr");
-        if !["fra", "ams", "lon", "nyc", "tor", "sgp", "blr", "syd"].contains(&region.as_str()) {
-            bail!("invalid region");
-        }
-        let upstream_host = if test_mode {
-            "mock-upstream".into()
-        } else {
-            format!("{region}.p.shifter.io")
-        };
-        let upstream_port = if test_mode { 1080 } else { 443 };
-        let (account, password) = if test_mode {
-            ("fixture".into(), "fixture-password".into())
-        } else if role == "gateway" {
-            let path = val("CREDENTIALS_FILE", "/run/secrets/shifter_credentials");
-            let contents =
-                std::fs::read_to_string(path).context("cannot read credential secret")?;
-            // Do not expose TOML parse errors: they may include the secret's source line.
-            let secrets: Secrets = toml::from_str(&contents)
-                .map_err(|_| anyhow::anyhow!("invalid credential secret"))?;
-            (
-                secrets
-                    .shifter
-                    .account
-                    .trim_start_matches("customer-")
-                    .to_string(),
-                secrets.shifter.password,
-            )
-        } else {
-            (String::new(), String::new())
-        };
-        if role == "gateway" {
-            if account.is_empty()
-                || !account
-                    .bytes()
-                    .all(|x| x.is_ascii_alphanumeric() || b"._".contains(&x))
-            {
-                bail!("invalid account syntax");
-            }
-            if password.is_empty() || !password.is_ascii() || password.len() > 255 {
-                bail!("invalid SOCKS password length/encoding");
-            }
-        }
-        let upstream_ips = if role == "gateway" {
-            tokio::net::lookup_host((upstream_host.as_str(), upstream_port))
-                .await
-                .context("upstream DNS unavailable")?
-                .map(|x| x.ip())
-                .collect()
-        } else {
-            vec![]
-        };
+        let captcha = captcha_config::load(&scope, &|key: &str| env::var(key).ok())?;
+        let region = region()?;
+        let upstream = Upstream::load(&role, &region, test_mode).await?;
         let cfg = Self {
             role,
             replica: val("REPLICA", "api"),
@@ -417,15 +321,14 @@ impl Config {
             redis_ca_file: env::var("REDIS_CA_FILE").ok().filter(|v| !v.is_empty()),
             control_origin,
             integrations,
-            captcha_site_key,
-            captcha_secret,
+            captcha,
             runtime_origin,
             region,
-            upstream_host,
-            upstream_port,
-            upstream_ips,
-            account,
-            password,
+            upstream_host: upstream.host,
+            upstream_port: upstream.port,
+            upstream_ips: upstream.ips,
+            account: upstream.account,
+            password: upstream.password,
             duration_ms: allowance_duration(number("SESSION_SECONDS", 86400)?)?,
             byte_limit: number("BYTE_LIMIT", 10_000_000_000)?,
             max_streams: number("MAX_STREAMS", 64)? as usize,
@@ -447,6 +350,116 @@ impl Config {
     pub fn username(&self, country: &str, sid: &str) -> Result<String> {
         routing_username(&self.account, country, sid)
     }
+}
+
+fn load_integrations(control: &str, runtime: &str, production: bool) -> Result<Vec<Integration>> {
+    let configured = if production {
+        env::var("INTEGRATIONS").context("production requires explicit INTEGRATIONS")?
+    } else {
+        val(
+            "INTEGRATIONS",
+            &serde_json::json!([{"origin":control,"site":"local"}]).to_string(),
+        )
+    };
+    integrations(&configured, runtime, production)
+}
+
+async fn load_redis(production: bool) -> Result<String> {
+    let redis = match env::var("REDIS_URL_FILE") {
+        Ok(path) => std::fs::read_to_string(path)
+            .map_err(|_| anyhow::anyhow!("cannot read REDIS_URL_FILE"))?
+            .trim()
+            .to_owned(),
+        Err(_) => val("REDIS_URL", "redis://redis:6379/"),
+    };
+    if production {
+        let (host, port) = production_redis(&redis)?;
+        let addresses: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|_| anyhow::anyhow!("production Redis private DNS lookup failed"))?
+            .collect();
+        if addresses.is_empty() || addresses.iter().any(|a| !private_ip(a.ip())) {
+            bail!("production Redis must resolve only to private RFC1918/ULA addresses");
+        }
+    }
+    Ok(redis)
+}
+
+fn region() -> Result<String> {
+    let region = val("SHIFTER_REGION", "blr");
+    if !["fra", "ams", "lon", "nyc", "tor", "sgp", "blr", "syd"].contains(&region.as_str()) {
+        bail!("invalid region");
+    }
+    Ok(region)
+}
+
+/// The Shifter upstream a gateway connects to, and its account.
+struct Upstream {
+    host: String,
+    port: u16,
+    ips: Vec<IpAddr>,
+    account: String,
+    password: String,
+}
+
+impl Upstream {
+    async fn load(role: &str, region: &str, test_mode: bool) -> Result<Self> {
+        let (host, port) = if test_mode {
+            ("mock-upstream".to_owned(), 1080)
+        } else {
+            (format!("{region}.p.shifter.io"), 443)
+        };
+        let (account, password) = upstream_account(role, test_mode)?;
+        let ips = if role == "gateway" {
+            tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .context("upstream DNS unavailable")?
+                .map(|x| x.ip())
+                .collect()
+        } else {
+            vec![]
+        };
+        Ok(Self {
+            host,
+            port,
+            ips,
+            account,
+            password,
+        })
+    }
+}
+
+fn upstream_account(role: &str, test_mode: bool) -> Result<(String, String)> {
+    let (account, password) = if test_mode {
+        ("fixture".into(), "fixture-password".into())
+    } else if role == "gateway" {
+        read_credentials()?
+    } else {
+        (String::new(), String::new())
+    };
+    if role == "gateway" {
+        if account.is_empty()
+            || !account
+                .bytes()
+                .all(|x| x.is_ascii_alphanumeric() || b"._".contains(&x))
+        {
+            bail!("invalid account syntax");
+        }
+        if password.is_empty() || !password.is_ascii() || password.len() > 255 {
+            bail!("invalid SOCKS password length/encoding");
+        }
+    }
+    Ok((account, password))
+}
+
+fn read_credentials() -> Result<(String, String)> {
+    let path = val("CREDENTIALS_FILE", "/run/secrets/shifter_credentials");
+    let contents = std::fs::read_to_string(path).context("cannot read credential secret")?;
+    // Do not expose TOML parse errors: they may include the secret's source line.
+    let secrets: Secrets =
+        toml::from_str(&contents).map_err(|_| anyhow::anyhow!("invalid credential secret"))?;
+    let account = secrets.shifter.account.trim_start_matches("customer-");
+    Ok((account.to_string(), secrets.shifter.password))
 }
 
 /// Shifter-pool countries are pinned with `pool-shifter`; the rest use the global pool.
@@ -555,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn integrations_and_captcha_are_strict() {
+    fn integrations_are_strict() {
         let value = r#"[{"origin":"https://example.com","site":"shifter"},{"origin":"https://second.example.com","site":"ip-info"}]"#;
         assert_eq!(
             integrations(value, "https://proxy.example.net", true)
@@ -574,13 +587,6 @@ mod tests {
         ] {
             assert!(integrations(value, "https://proxy.example.net", true).is_err());
         }
-        assert!(validate_captcha("", "", true).is_err());
-        assert!(
-            validate_captcha("6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI", "fixture", true).is_err()
-        );
-        assert!(
-            validate_captcha("fixture", "6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe", true).is_err()
-        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
-//! Google verification is always server-side; no configurable production verifier URL.
-use crate::{State, config::now_ms};
+//! Server-side CAPTCHA verification: Google reCAPTCHA, or self-hosted Cap
+//! (CAPTCHA_PROVIDER=cap, one site key per embedding origin).
+use crate::{State, captcha_config::CapConfig, config::now_ms};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -24,16 +25,23 @@ pub fn valid(result: &Verification, hostname: &str, now: u64) -> bool {
 }
 
 pub async fn verify(state: &State, token: &str, hostname: &str) -> Result<bool, ()> {
-    if state.cfg.captcha_secret.is_empty() {
+    let settings = &state.cfg.captcha;
+    if settings.secret.is_empty() {
         return Err(());
+    }
+    if settings.cap_staging {
+        // The pilot's isolated Compose network is the only Cap verifier target.
+        let site = Site {
+            base: "http://capd:3000",
+            key: &settings.site_key,
+            secret: &settings.secret,
+        };
+        return cap_siteverify(&state.captcha_client, &site, token).await;
     }
     let response = state
         .captcha_client
         .post("https://www.google.com/recaptcha/api/siteverify")
-        .form(&[
-            ("secret", state.cfg.captcha_secret.as_str()),
-            ("response", token),
-        ])
+        .form(&[("secret", settings.secret.as_str()), ("response", token)])
         .send()
         .await
         .map_err(|_| ())?;
@@ -44,33 +52,102 @@ pub async fn verify(state: &State, token: &str, hostname: &str) -> Result<bool, 
     Ok(valid(&result, hostname, now_ms()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn verifier_rejects_expiry_hostname_failure_and_quota_errors() {
-        let now = 1_700_000_000_000;
-        let mut v = Verification {
-            success: true,
-            hostname: Some("example.com".into()),
-            challenge_ts: Some("2023-11-14T22:13:00Z".into()),
-            errors: vec![],
-        };
-        assert!(valid(&v, "example.com", now));
-        assert!(!valid(&v, "second.example.com", now));
-        // challenge_ts is widget load time, not response issuance. Google enforces
-        // the response's two-minute lifetime; slow human challenges remain valid.
-        assert!(valid(&v, "example.com", now + 121_000));
-        v.errors.push("timeout-or-duplicate".into());
-        assert!(!valid(&v, "example.com", now));
-        v.errors.clear();
-        v.errors.push("Over free quota.".into());
-        assert!(!valid(&v, "example.com", now));
-        v.errors.clear();
-        v.success = false;
-        assert!(!valid(&v, "example.com", now));
-        v.success = true;
-        v.challenge_ts = None;
-        assert!(!valid(&v, "example.com", now));
+enum Verifier<'a> {
+    Cap(&'a CapConfig),
+    Legacy,
+}
+
+fn verifier<'a>(cap: Option<&'a CapConfig>, accept_both: bool, token: &str) -> Verifier<'a> {
+    match cap {
+        // Cap carries a colon-delimited site key, challenge and answer. Never
+        // fall back to another verifier after rejection or a transport error.
+        Some(cap) if !accept_both || token.contains(':') => Verifier::Cap(cap),
+        _ => Verifier::Legacy,
     }
 }
+
+pub async fn verify_for_integration(
+    state: &State,
+    token: &str,
+    hostname: &str,
+    integration_origin: &str,
+) -> Result<bool, ()> {
+    let settings = &state.cfg.captcha;
+    match verifier(settings.cap.as_ref(), settings.accept_both, token) {
+        Verifier::Cap(cap) => {
+            verify_cap(&state.captcha_client, cap, token, integration_origin).await
+        }
+        Verifier::Legacy => verify(state, token, hostname).await,
+    }
+}
+
+/// Use the Cap key for the matched integration, not one supplied by the browser.
+async fn verify_cap(
+    client: &reqwest::Client,
+    cap: &CapConfig,
+    token: &str,
+    integration_origin: &str,
+) -> Result<bool, ()> {
+    let Some(site) = cap.site(integration_origin) else {
+        return Err(());
+    };
+    let site = Site {
+        base: &cap.verify_url,
+        key: &site.site_key,
+        secret: &site.secret,
+    };
+    cap_siteverify(client, &site, token).await
+}
+
+/// One Cap site as the verifier sees it: its base URL, key and secret.
+struct Site<'a> {
+    base: &'a str,
+    key: &'a str,
+    secret: &'a str,
+}
+
+/// 200 with `success` decides; 400, 403 and 404 reject; anything else is unavailable.
+async fn cap_siteverify(
+    client: &reqwest::Client,
+    site: &Site<'_>,
+    token: &str,
+) -> Result<bool, ()> {
+    if site.secret.is_empty() {
+        return Err(());
+    }
+    if !cap_site_matches(token, site.key) {
+        return Ok(false);
+    }
+    let response = client
+        .post(format!("{}/{}/siteverify", site.base, site.key))
+        .json(&serde_json::json!({"secret": site.secret, "response": token}))
+        .send()
+        .await
+        .map_err(|_| ())?;
+    match response.status().as_u16() {
+        200 => response
+            .json::<CapVerification>()
+            .await
+            .map(|result| result.success)
+            .map_err(|_| ()),
+        400 | 403 | 404 => Ok(false),
+        _ => Err(()),
+    }
+}
+
+#[derive(Deserialize)]
+struct CapVerification {
+    success: bool,
+}
+
+fn cap_site_matches(token: &str, site_key: &str) -> bool {
+    let mut parts = token.split(':');
+    parts.next() == Some(site_key)
+        && parts.next().is_some_and(|part| !part.is_empty())
+        && parts.next().is_some_and(|part| !part.is_empty())
+        && parts.next().is_none()
+}
+
+#[cfg(test)]
+#[path = "captcha_tests.rs"]
+mod tests;
