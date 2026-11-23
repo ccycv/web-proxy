@@ -101,7 +101,8 @@ def render(provider, public, verify):
 
 
 def rejected_by_verifier(code, body):
-    return code in [200, 400, 403, 404] and body.get('success') is False
+    # Do not mistake an authentication failure for a working verifier credential.
+    return code == 404 and body.get('success') is False and body.get('error') == 'Token not found'
 
 
 def promote_loader(release):

@@ -31,6 +31,8 @@ class CutoverTests(unittest.TestCase):
     def test_real_cap_missing_token_and_network_errors(self):
         self.assertTrue(node.rejected_by_verifier(404, {'success': False, 'error': 'Token not found'}))
         self.assertFalse(node.rejected_by_verifier(404, {}))
+        self.assertFalse(node.rejected_by_verifier(403, {'success': False, 'error': 'Invalid secret'}))
+        self.assertFalse(node.rejected_by_verifier(404, {'success': False, 'error': 'Site not found'}))
         self.assertFalse(node.rejected_by_verifier(500, {'success': False}))
         self.assertFalse(node.rejected_by_verifier(200, {'success': True}))
 
