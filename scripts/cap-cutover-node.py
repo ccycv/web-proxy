@@ -133,6 +133,14 @@ def activate_link(release):
     link.replace('/opt/web-proxy/current')
 
 
+def verify_served_sdk(node, release):
+    for port in [3000, 3001]:
+        for relative in ['sdk/v1/shifter-web-proxy.js', 'sdk/releases/1.0.12/manifest.json',
+                         'sdk/releases/1.0.12/client.js', 'sdk/releases/1.0.12/captcha.js']:
+            with urllib.request.urlopen('http://' + node['private_ip'] + ':' + str(port) + '/' + relative, timeout=15) as response:
+                require(response.read() == (release / 'web' / relative).read_bytes(), 'served SDK asset mismatch')
+
+
 def main(a):
     node, mode = a['node'], a['mode']
     before = check(node)
@@ -142,6 +150,10 @@ def main(a):
     require(a.get('apply') is True, 'apply required')
     release = Path(before['release'])
     require('commit=' + a['commit'] in (release / 'BUILD.txt').read_text().splitlines(), 'wrong application revision')
+    if mode == 'loader' and before['loader_version'] == '1.0.12':
+        require(before['dual'] == 'true', 'prepare dual verification first')
+        verify_served_sdk(node, release)
+        return {**before, 'mode': mode, 'result': 'already_current'}
     # Preserve all old environment and credential files; only an additive API drop-in is managed here.
     managed = [Path('/etc/web-proxy/cap-transition.env'),
                Path('/etc/systemd/system/web-proxy-api.service.d/90-cap-transition.conf')]
@@ -205,11 +217,7 @@ def main(a):
         if mode == 'loader':
             current = Path(result['release'])
             require(result['loader_version'] == '1.0.12', 'loader promotion missing')
-            for port in [3000, 3001]:
-                for relative in ['sdk/v1/shifter-web-proxy.js', 'sdk/releases/1.0.12/manifest.json',
-                                 'sdk/releases/1.0.12/client.js', 'sdk/releases/1.0.12/captcha.js']:
-                    with urllib.request.urlopen('http://' + node['private_ip'] + ':' + str(port) + '/' + relative, timeout=15) as response:
-                        require(response.read() == (current / 'web' / relative).read_bytes(), 'served SDK asset mismatch')
+            verify_served_sdk(node, current)
         return {**result, 'backup': str(backup), 'mode': mode}
     except Exception:
         if not changed:

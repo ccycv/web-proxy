@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 def load(name):
@@ -16,6 +17,17 @@ fleet = load('cap-cutover')
 
 
 class CutoverTests(unittest.TestCase):
+    def test_promoted_loader_is_verified_without_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'BUILD.txt').write_text('commit=test\n')
+            before = {'release': directory, 'loader_version': '1.0.12', 'dual': 'true'}
+            with mock.patch.object(node, 'check', return_value=before), mock.patch.object(node, 'verify_served_sdk') as verify, mock.patch.object(node, 'run') as run:
+                result = node.main({'node': {}, 'mode': 'loader', 'apply': True, 'commit': 'test'})
+                self.assertEqual(result['result'], 'already_current')
+                verify.assert_called_once_with({}, root)
+                run.assert_not_called()
+
     def test_real_cap_missing_token_and_network_errors(self):
         self.assertTrue(node.rejected_by_verifier(404, {'success': False, 'error': 'Token not found'}))
         self.assertFalse(node.rejected_by_verifier(404, {}))
