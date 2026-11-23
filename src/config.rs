@@ -174,6 +174,8 @@ pub struct Config {
     pub captcha_site_key: String,
     pub captcha_secret: String,
     pub cap_staging: bool,
+    /// Cap (self-hosted proof-of-work CAPTCHA) when CAPTCHA_PROVIDER=cap.
+    pub cap: Option<CapConfig>,
     pub runtime_origin: String,
     pub region: String,
     pub upstream_host: String,
@@ -191,6 +193,78 @@ pub struct Config {
     pub test_mode: bool,
     pub web_dir: String,
 }
+/// One Cap site key per embedding origin, so a token solved for one website
+/// cannot start a session on another (Cap tokens carry no hostname).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CapSite {
+    /// Exactly an INTEGRATIONS origin, wildcard patterns included.
+    pub origin: String,
+    pub site_key: String,
+    pub secret: String,
+}
+
+#[derive(Clone)]
+pub struct CapConfig {
+    /// Private base URL the API calls for /<siteKey>/siteverify.
+    pub verify_url: String,
+    /// Public base URL browsers load the widget and challenges from.
+    pub public_url: String,
+    pub sites: Vec<CapSite>,
+}
+
+impl CapConfig {
+    pub fn site(&self, integration_origin: &str) -> Option<&CapSite> {
+        self.sites.iter().find(|s| s.origin == integration_origin)
+    }
+}
+
+fn valid_cap_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+}
+
+pub fn validate_cap(cap: &CapConfig, entries: &[Integration], production: bool) -> Result<()> {
+    let public = url::Url::parse(&cap.public_url)
+        .map_err(|_| anyhow::anyhow!("CAP_PUBLIC_URL must be an absolute URL"))?;
+    if !["http", "https"].contains(&public.scheme())
+        || public.path() != "/"
+        || public.query().is_some()
+        || (production && public.scheme() != "https")
+    {
+        bail!("CAP_PUBLIC_URL must be a bare http(s) origin, HTTPS in production");
+    }
+    let verify = url::Url::parse(&cap.verify_url)
+        .map_err(|_| anyhow::anyhow!("CAP_VERIFY_URL must be an absolute URL"))?;
+    if !["http", "https"].contains(&verify.scheme()) {
+        bail!("CAP_VERIFY_URL must be http(s)");
+    }
+    for entry in entries {
+        if cap.site(&entry.origin).is_none() {
+            bail!("CAP_SITES_FILE has no site key for {}", entry.origin);
+        }
+    }
+    let mut keys = std::collections::HashSet::new();
+    for site in &cap.sites {
+        if !valid_cap_key(&site.site_key) || site.secret.is_empty() {
+            bail!("every CAP_SITES_FILE entry needs a valid siteKey and a secret");
+        }
+        if !entries.iter().any(|e| e.origin == site.origin) {
+            bail!(
+                "CAP_SITES_FILE origin {} is not in INTEGRATIONS",
+                site.origin
+            );
+        }
+        if !keys.insert(site.site_key.as_str()) {
+            bail!("each origin needs its own Cap site key");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Integration {
@@ -372,9 +446,10 @@ impl Config {
         if !["api", "gateway"].contains(&role.as_str()) {
             bail!("invalid ROLE");
         }
-        let cap_staging = match val("CAPTCHA_PROVIDER", "recaptcha").as_str() {
-            "recaptcha" => false,
-            "cap-staging" => true,
+        let (cap_staging, cap_provider) = match val("CAPTCHA_PROVIDER", "recaptcha").as_str() {
+            "recaptcha" => (false, false),
+            "cap-staging" => (true, false),
+            "cap" => (false, true),
             _ => bail!("unknown CAPTCHA_PROVIDER"),
         };
         if cap_staging && (environment != "development" || role != "api") {
@@ -385,9 +460,13 @@ impl Config {
         } else {
             ("RECAPTCHA_SITE_KEY", "RECAPTCHA_SECRET_FILE")
         };
-        let captcha_site_key = val(site_key_var, "");
+        let captcha_site_key = if cap_provider {
+            String::new()
+        } else {
+            val(site_key_var, "")
+        };
         // Only the API process receives the verification secret.
-        let captcha_secret = if role == "api" {
+        let captcha_secret = if role == "api" && !cap_provider {
             match env::var(secret_file_var) {
                 Ok(path) if !path.is_empty() => std::fs::read_to_string(path)
                     .map_err(|_| anyhow::anyhow!("cannot read {secret_file_var}"))?
@@ -398,7 +477,35 @@ impl Config {
         } else {
             String::new()
         };
-        if cap_staging {
+        let cap = if cap_provider {
+            // Site secrets come from a private file, only in the API process.
+            let sites: Vec<CapSite> = if role == "api" {
+                let path = env::var("CAP_SITES_FILE")
+                    .context("CAPTCHA_PROVIDER=cap requires CAP_SITES_FILE")?;
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|_| anyhow::anyhow!("cannot read CAP_SITES_FILE"))?;
+                serde_json::from_str(&text)
+                    .map_err(|_| anyhow::anyhow!("invalid CAP_SITES_FILE JSON"))?
+            } else {
+                vec![]
+            };
+            let cap = CapConfig {
+                verify_url: val("CAP_VERIFY_URL", "http://capd:3000")
+                    .trim_end_matches('/')
+                    .to_owned(),
+                public_url: val("CAP_PUBLIC_URL", "").trim_end_matches('/').to_owned(),
+                sites,
+            };
+            if role == "api" {
+                validate_cap(&cap, &integrations, production)?;
+            }
+            Some(cap)
+        } else {
+            None
+        };
+        if cap_provider {
+            // Validated above.
+        } else if cap_staging {
             validate_cap_staging(
                 &environment,
                 &role,
@@ -472,6 +579,7 @@ impl Config {
             captcha_site_key,
             captcha_secret,
             cap_staging,
+            cap,
             runtime_origin,
             region,
             upstream_host,
@@ -724,6 +832,88 @@ mod tests {
             SHIFTER_POOL_COUNTRIES.len() + GLOBAL_POOL_COUNTRIES.len()
         );
         assert!(routing_username("acct", "xx", sid).is_err());
+    }
+
+    #[test]
+    fn cap_needs_one_key_per_integration_and_https_in_production() {
+        let entries = vec![
+            Integration {
+                origin: "https://shifter.io".into(),
+                site: "shifter".into(),
+            },
+            Integration {
+                origin: "https://*.shifter-bitch.com".into(),
+                site: "shifter".into(),
+            },
+        ];
+        let site = |origin: &str, key: &str| CapSite {
+            origin: origin.into(),
+            site_key: key.into(),
+            secret: "secret".into(),
+        };
+        let cap = |public: &str, sites: Vec<CapSite>| CapConfig {
+            verify_url: "http://capd:3000".into(),
+            public_url: public.into(),
+            sites,
+        };
+        let both = vec![
+            site("https://shifter.io", "main"),
+            site("https://*.shifter-bitch.com", "previews"),
+        ];
+        assert!(
+            validate_cap(
+                &cap("https://cap.example.com", both.clone()),
+                &entries,
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_cap(
+                &cap("http://cap.example.com", both.clone()),
+                &entries,
+                false
+            )
+            .is_ok()
+        );
+        // Production needs HTTPS for the widget origin, and a bare origin.
+        assert!(
+            validate_cap(&cap("http://cap.example.com", both.clone()), &entries, true).is_err()
+        );
+        assert!(
+            validate_cap(
+                &cap("https://cap.example.com/x", both.clone()),
+                &entries,
+                true
+            )
+            .is_err()
+        );
+        // Every integration needs its own key; unknown origins and shared keys are refused.
+        assert!(
+            validate_cap(
+                &cap("https://cap.example.com", both[..1].to_vec()),
+                &entries,
+                true
+            )
+            .is_err()
+        );
+        let shared = vec![
+            site("https://shifter.io", "same"),
+            site("https://*.shifter-bitch.com", "same"),
+        ];
+        assert!(validate_cap(&cap("https://cap.example.com", shared), &entries, true).is_err());
+        let mut extra = both.clone();
+        extra.push(site("https://other.example", "other"));
+        assert!(validate_cap(&cap("https://cap.example.com", extra), &entries, true).is_err());
+        let mut bad = both.clone();
+        bad[0].secret = String::new();
+        assert!(validate_cap(&cap("https://cap.example.com", bad), &entries, true).is_err());
+        assert_eq!(
+            cap("https://cap.example.com", both)
+                .site("https://*.shifter-bitch.com")
+                .map(|s| s.site_key.as_str()),
+            Some("previews")
+        );
     }
 
     #[test]

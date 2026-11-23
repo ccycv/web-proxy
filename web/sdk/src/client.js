@@ -329,7 +329,7 @@ export function create({container, apiOrigin, nonce} = {}) {
       const previousStatus = state.status;
       emit({status:'verifying'});
       let captchaToken;
-      try { captchaToken = await challenge(config.captchaSiteKey,{nonce,signal:controller.signal}); }
+      try { captchaToken = await challenge(config.captchaSiteKey,{nonce,signal:controller.signal,provider:config.captchaProvider,capEndpoint:config.capEndpoint,capAssets:config.capAssets}); }
       finally { emit({status:previousStatus}); }
       const result = await api('sessions','POST',{country,captchaToken});
       if (result.credential) persist(result.credential);

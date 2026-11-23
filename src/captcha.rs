@@ -1,5 +1,9 @@
-//! Production keeps server-side Google verification. Cap is a staging-only pilot.
-use crate::{State, config::now_ms};
+//! Server-side CAPTCHA verification: Google reCAPTCHA, or self-hosted Cap
+//! (CAPTCHA_PROVIDER=cap, one site key per embedding origin).
+use crate::{
+    State,
+    config::{CapConfig, now_ms},
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -28,30 +32,15 @@ pub async fn verify(state: &State, token: &str, hostname: &str) -> Result<bool, 
         return Err(());
     }
     if state.cfg.cap_staging {
-        let site_key = &state.cfg.captcha_site_key;
-        if !cap_site_matches(token, site_key) {
-            return Ok(false);
-        }
         // The pilot's isolated Compose network is the only Cap verifier target.
-        let response = state
-            .captcha_client
-            .post(format!("http://capd:3000/{site_key}/siteverify"))
-            .json(&serde_json::json!({
-                "secret": state.cfg.captcha_secret,
-                "response": token,
-            }))
-            .send()
-            .await
-            .map_err(|_| ())?;
-        return match response.status().as_u16() {
-            200 => response
-                .json::<CapVerification>()
-                .await
-                .map(|result| result.success)
-                .map_err(|_| ()),
-            400 | 403 | 404 => Ok(false),
-            _ => Err(()),
-        };
+        return cap_siteverify(
+            state,
+            "http://capd:3000",
+            &state.cfg.captcha_site_key,
+            &state.cfg.captcha_secret,
+            token,
+        )
+        .await;
     }
     let response = state
         .captcha_client
@@ -68,6 +57,51 @@ pub async fn verify(state: &State, token: &str, hostname: &str) -> Result<bool, 
     }
     let result: Verification = response.json().await.map_err(|_| ())?;
     Ok(valid(&result, hostname, now_ms()))
+}
+
+/// Verify a Cap token for the website it was solved on. `integration_origin`
+/// is the matched INTEGRATIONS entry, so each site needs its own site key.
+pub async fn verify_cap(
+    state: &State,
+    cap: &CapConfig,
+    token: &str,
+    integration_origin: &str,
+) -> Result<bool, ()> {
+    let Some(site) = cap.site(integration_origin) else {
+        return Err(());
+    };
+    cap_siteverify(state, &cap.verify_url, &site.site_key, &site.secret, token).await
+}
+
+async fn cap_siteverify(
+    state: &State,
+    base: &str,
+    site_key: &str,
+    secret: &str,
+    token: &str,
+) -> Result<bool, ()> {
+    if secret.is_empty() {
+        return Err(());
+    }
+    if !cap_site_matches(token, site_key) {
+        return Ok(false);
+    }
+    let response = state
+        .captcha_client
+        .post(format!("{base}/{site_key}/siteverify"))
+        .json(&serde_json::json!({"secret": secret, "response": token}))
+        .send()
+        .await
+        .map_err(|_| ())?;
+    match response.status().as_u16() {
+        200 => response
+            .json::<CapVerification>()
+            .await
+            .map(|result| result.success)
+            .map_err(|_| ()),
+        400 | 403 | 404 => Ok(false),
+        _ => Err(()),
+    }
 }
 
 #[derive(Deserialize)]

@@ -197,10 +197,20 @@ pub fn router(s: &State) -> Router<State> {
 }
 async fn config(AppState(s): AppState<State>, h: HeaderMap) -> Result<Json<Value>> {
     let (site, _) = integration(&h, &s)?;
-    Ok(Json(
-        json!({"site":site.site, "countries":countries().iter().map(|(code,name)|json!({"code":code,"name":name})).collect::<Vec<_>>(),
-        "runtimeOrigin":s.cfg.runtime_origin,"captchaSiteKey":s.cfg.captcha_site_key,"protocolVersion":1}),
-    ))
+    let mut body = json!({"site":site.site, "countries":countries().iter().map(|(code,name)|json!({"code":code,"name":name})).collect::<Vec<_>>(),
+        "runtimeOrigin":s.cfg.runtime_origin,"captchaSiteKey":s.cfg.captcha_site_key,"captchaProvider":"recaptcha","protocolVersion":1});
+    if let Some(cap) = &s.cfg.cap {
+        // Public values only: the site key and where the widget and challenges live.
+        let key = cap
+            .site(&site.origin)
+            .map(|c| c.site_key.as_str())
+            .unwrap_or_default();
+        body["captchaProvider"] = json!("cap");
+        body["captchaSiteKey"] = json!(key);
+        body["capEndpoint"] = json!(format!("{}/{key}/", cap.public_url));
+        body["capAssets"] = json!(format!("{}/assets/", cap.public_url));
+    }
+    Ok(Json(body))
 }
 async fn start(
     AppState(s): AppState<State>,
@@ -252,15 +262,18 @@ async fn start(
             .map_err(storage)?;
         expected.as_deref() == Some(hostname.as_str())
     } else {
-        captcha::verify(&s, &input.captcha_token, &hostname)
-            .await
-            .map_err(|_| {
-                Error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "CAPTCHA_UNAVAILABLE",
-                    "Verification unavailable; please try again",
-                )
-            })?
+        let checked = if let Some(cap) = &s.cfg.cap {
+            captcha::verify_cap(&s, cap, &input.captcha_token, &site.origin).await
+        } else {
+            captcha::verify(&s, &input.captcha_token, &hostname).await
+        };
+        checked.map_err(|_| {
+            Error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CAPTCHA_UNAVAILABLE",
+                "Verification unavailable; please try again",
+            )
+        })?
     };
     if !verified {
         return Err(Error(
