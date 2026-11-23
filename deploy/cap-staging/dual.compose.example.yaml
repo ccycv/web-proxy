@@ -1,0 +1,14 @@
+# Optional staging-only overlay, after provisioning a real reCAPTCHA v2 key pair.
+# The secret file must be readable by the API container UID, not the gateway.
+services:
+  api:
+    environment:
+      CAPTCHA_PROVIDER: ${CAP_STAGING_PROVIDER:?Set cap or recaptcha explicitly}
+      CAPTCHA_ACCEPT_BOTH: "true"
+      RECAPTCHA_SITE_KEY: ${CAP_STAGING_RECAPTCHA_SITE_KEY:?Set the staging site key}
+      RECAPTCHA_SECRET_FILE: /run/secrets/staging_recaptcha
+    secrets:
+      - staging_recaptcha
+secrets:
+  staging_recaptcha:
+    file: ${CAP_STAGING_RECAPTCHA_SECRET_FILE:?Set the absolute protected secret path}
