@@ -1,0 +1,17 @@
+# Merge only with an existing isolated staging compose project, never production.
+# Keep the project name and existing private networks/secrets unchanged.
+services:
+  api:
+    image: ${CAP_STAGING_IMAGE:?Set the immutable staging candidate image}
+    volumes:
+      - type: bind
+        source: ${CAP_STAGING_LOADER:?Set the absolute staging-only loader path}
+        target: /app/web/sdk/v1/shifter-web-proxy.js
+        read_only: true
+  gateway:
+    image: ${CAP_STAGING_IMAGE:?Set the immutable staging candidate image}
+    volumes:
+      - type: bind
+        source: ${CAP_STAGING_LOADER:?Set the absolute staging-only loader path}
+        target: /app/web/sdk/v1/shifter-web-proxy.js
+        read_only: true
